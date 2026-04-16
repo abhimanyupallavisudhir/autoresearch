@@ -12,8 +12,9 @@ To set up a new experiment, work with the user to:
    - `README.md` — repository context.
    - `prepare.py` — fixed constants, data prep, tokenizer, dataloader, evaluation. Do not modify.
    - `train.py` — the file you modify. Model architecture, optimizer, training loop.
+   - `search.py` — search-state orchestrator. Use this to manage the frontier and results.
 4. **Verify data exists**: Check that `~/.cache/autoresearch/` contains data shards and a tokenizer. If not, tell the human to run `uv run prepare.py`.
-5. **Initialize results.tsv**: Create `results.tsv` with just the header row. The baseline will be recorded after the first run.
+5. **Initialize search state**: Run `uv run search.py init --run-tag <tag>`. This creates `.autoresearch/state.json` and `results.tsv`.
 6. **Confirm and go**: Confirm setup looks good.
 
 Once you get confirmation, kick off the experimentation.
@@ -61,30 +62,53 @@ Note that the script is configured to always stop after 5 minutes, so depending 
 grep "^val_bpb:" run.log
 ```
 
+## Search strategy
+
+Do not do pure greedy hill climbing from a single incumbent. This repo is path-dependent, so a change that looks weak on one parent can be a strong stepping stone on another.
+
+Use a **population-based search**:
+
+- Keep a **frontier** of up to 5 commits: 1 champion plus up to 4 diverse runners-up.
+- Mutate from any frontier member, not just the champion.
+- Keep near-best commits if they are structurally different enough to be plausible stepping stones.
+- Every 10 experiments, attempt one **recombination** experiment by combining two complementary frontier branches.
+- Treat crashes as failures, but do not collapse the frontier because one branch failed.
+- For especially promising candidates, plan to re-run later for robustness; do not promote or demote solely on one noisy lucky run if the gain is tiny.
+
+The `search.py` script manages the frontier, diversity heuristics, and parent/recombination suggestions. Use it instead of manually deciding every step.
+
 ## Logging results
 
 When an experiment is done, log it to `results.tsv` (tab-separated, NOT comma-separated — commas break in descriptions).
 
-The TSV has a header row and 5 columns:
+The TSV has a header row and 13 columns:
 
 ```
-commit	val_bpb	memory_gb	status	description
+experiment_id	timestamp	mode	commit	parent	parent_b	val_bpb	memory_gb	status	description	tags	frontier_action	log_path
 ```
 
-1. git commit hash (short, 7 chars)
-2. val_bpb achieved (e.g. 1.234567) — use 0.000000 for crashes
-3. peak memory in GB, round to .1f (e.g. 12.3 — divide peak_vram_mb by 1024) — use 0.0 for crashes
-4. status: `keep`, `discard`, or `crash`
-5. short text description of what this experiment tried
+1. `experiment_id`: sequential integer assigned by the orchestrator
+2. `timestamp`: UTC timestamp when the experiment was registered
+3. `mode`: `baseline`, `mutate`, or `recombine`
+4. `commit`: git commit hash (short, 7 chars)
+5. `parent`: primary parent commit hash the experiment branched from
+6. `parent_b`: optional second parent for recombination experiments
+7. `val_bpb`: achieved value (e.g. 1.234567) — use 0.000000 for crashes
+8. `memory_gb`: peak memory in GB, round to .1f (e.g. 12.3 — divide peak_vram_mb by 1024) — use 0.0 for crashes
+9. `status`: `keep`, `discard`, or `crash`
+10. `description`: short text description of what this experiment tried
+11. `tags`: optional tags; `search.py` can also infer tags from the diff
+12. `frontier_action`: one of `champion`, `frontier`, or `archive`
+13. `log_path`: path to the saved log file for this run
 
 Example:
 
 ```
-commit	val_bpb	memory_gb	status	description
-a1b2c3d	0.997900	44.0	keep	baseline
-b2c3d4e	0.993200	44.2	keep	increase LR to 0.04
-c3d4e5f	1.005000	44.0	discard	switch to GeLU activation
-d4e5f6g	0.000000	0.0	crash	double model width (OOM)
+experiment_id	timestamp	mode	commit	parent	parent_b	val_bpb	memory_gb	status	description	tags	frontier_action	log_path
+1	2026-04-16T12:00:00+00:00	baseline	a1b2c3d	a1b2c3d		0.997900	44.0	keep	baseline	baseline	champion	logs/001-baseline.log
+2	2026-04-16T12:07:00+00:00	mutate	b2c3d4e	a1b2c3d		0.993200	44.2	keep	increase LR to 0.04	matrix_lr,lr	champion	logs/002-lr.log
+3	2026-04-16T12:14:00+00:00	mutate	c3d4e5f	a1b2c3d		0.995000	44.0	discard	switch schedule	warmdown_ratio,scheduler	frontier	logs/003-schedule.log
+4	2026-04-16T12:21:00+00:00	recombine	d4e5f6g	b2c3d4e	c3d4e5f	0.000000	0.0	crash	combine LR and schedule	depth,model_dim	archive	logs/004-recombine.log
 ```
 
 ## The experiment loop
@@ -93,17 +117,29 @@ The experiment runs on a dedicated branch (e.g. `autoresearch/mar5` or `autorese
 
 LOOP FOREVER:
 
-1. Look at the git state: the current branch/commit we're on
-2. Tune `train.py` with an experimental idea by directly hacking the code.
-3. git commit
-4. Run the experiment: `uv run train.py > run.log 2>&1` (redirect everything — do NOT use tee or let output flood your context)
-5. Read out the results: `grep "^val_bpb:\|^peak_vram_mb:" run.log`
-6. If the grep output is empty, the run crashed. Run `tail -n 50 run.log` to read the Python stack trace and attempt a fix. If you can't get things to work after more than a few attempts, give up.
-7. Record the results in the tsv (NOTE: do not commit the results.tsv file, leave it untracked by git)
-8. If val_bpb improved (lower), you "advance" the branch, keeping the git commit
-9. If val_bpb is equal or worse, you git reset back to where you started
+1. Ask the orchestrator what to try next:
+   - `uv run search.py suggest`
+   - If it returns `mode=mutate`, start from `parent=<commit>`.
+   - If it returns `mode=recombine`, create a new commit that intentionally combines the main ideas from `parent_a` and `parent_b`.
+2. Check out the chosen parent commit into the working tree:
+   - `git checkout <parent> -- train.py`
+   - For recombination, inspect both parent diffs before editing.
+3. Tune `train.py` with one clear experimental idea. Keep the description crisp enough that it can become a useful log entry later.
+4. `git commit` the candidate change.
+5. Save each run to its own log file, never overwrite a single shared `run.log`. Example:
+   - `mkdir -p logs`
+   - `log_path="logs/$(date -u +%Y%m%dT%H%M%SZ)-candidate.log"`
+   - `uv run train.py > "$log_path" 2>&1`
+6. Read out the results: `grep "^val_bpb:\|^peak_vram_mb:" "$log_path"`
+7. If the grep output is empty, the run crashed. Run `tail -n 50 "$log_path"` to read the Python stack trace and attempt a fix. If you can't get things to work after more than a few attempts, log a crash and move on.
+8. Register the result with the orchestrator. Example:
+   - `uv run search.py register --mode mutate --parent <parent> --val-bpb 0.993200 --memory-gb 44.2 --status keep --description "increase LR to 0.04" --tags lr matrix_lr --log-path "$log_path"`
+   - For recombinations, also pass `--parent-b <parent_b>`.
+   - For crashes, use `--val-bpb 0 --memory-gb 0 --status crash`.
+9. Use `uv run search.py frontier` to inspect the active frontier when needed.
+10. Do not collapse back to a single best branch. The frontier is the search state. The working tree can move around freely as long as commits are logged and the frontier remains intact.
 
-The idea is that you are a completely autonomous researcher trying things out. If they work, keep. If they don't, discard. And you're advancing the branch so that you can iterate. If you feel like you're getting stuck in some way, you can rewind but you should probably do this very very sparingly (if ever).
+The idea is that you are a completely autonomous researcher trying things out across multiple nearby basins, not just greedily marching forward from a single line of descent. Favor edits that are understandable, composable, and easy to recombine.
 
 **Timeout**: Each experiment should take ~5 minutes total (+ a few seconds for startup and eval overhead). If a run exceeds 10 minutes, kill it and treat it as a failure (discard and revert).
 

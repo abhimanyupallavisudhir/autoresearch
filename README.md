@@ -13,6 +13,7 @@ The repo is deliberately kept small and only really has three files that matter:
 - **`prepare.py`** — fixed constants, one-time data prep (downloads training data, trains a BPE tokenizer), and runtime utilities (dataloader, evaluation). Not modified.
 - **`train.py`** — the single file the agent edits. Contains the full GPT model, optimizer (Muon + AdamW), and training loop. Everything is fair game: architecture, hyperparameters, optimizer, batch size, etc. **This file is edited and iterated on by the agent**.
 - **`program.md`** — baseline instructions for one agent. Point your agent here and let it go. **This file is edited and iterated on by the human**.
+- **`search.py`** — optional orchestration helper for path-aware search. It tracks a frontier of promising commits, suggests mutation parents, and recommends occasional recombinations.
 
 By design, training runs for a **fixed 5-minute time budget** (wall clock, excluding startup/compilation), regardless of the details of your compute. The metric is **val_bpb** (validation bits per byte) — lower is better, and vocab-size-independent so architectural changes are fairly compared.
 
@@ -49,12 +50,23 @@ Hi have a look at program.md and let's kick off a new experiment! let's do the s
 
 The `program.md` file is essentially a super lightweight "skill".
 
+## Analyzing results
+
+After experiments have been logged to `results.tsv` and per-run logs have been saved, generate the wider-search plots with:
+
+```bash
+uv run analyze_results.py
+```
+
+This writes plots to `analysis/`, including champion progress, frontier/search overview, and champion loss traces from saved run logs.
+
 ## Project structure
 
 ```
 prepare.py      — constants, data prep + runtime utilities (do not modify)
 train.py        — model, optimizer, training loop (agent modifies this)
 program.md      — agent instructions
+search.py       — frontier/recombination search state manager
 pyproject.toml  — dependencies
 ```
 

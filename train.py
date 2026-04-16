@@ -17,11 +17,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from kernels import get_kernel
 cap = torch.cuda.get_device_capability()
-# varunneal's FA3 is Hopper only, use kernels-community on non-Hopper GPUs
-repo = "varunneal/flash-attention-3" if cap == (9, 0) else "kernels-community/flash-attn3"
-fa3 = get_kernel(repo).flash_attn_interface
+USE_FA3 = cap == (9, 0)
+fa3 = None
+if USE_FA3:
+    from kernels import get_kernel
+    fa3 = get_kernel("varunneal/flash-attention-3").flash_attn_interface
 
 from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, make_dataloader, evaluate_bpb
 
@@ -58,6 +59,18 @@ def apply_rotary_emb(x, cos, sin):
     return torch.cat([y1, y2], 3)
 
 
+def sdpa_window_mask(T, window_size, device):
+    window = window_size[0]
+    if window < 0 or window >= T:
+        return None
+    mask = torch.full((T, T), float("-inf"), device=device)
+    idx = torch.arange(T, device=device)
+    distance = idx[:, None] - idx[None, :]
+    allowed = (distance >= 0) & (distance < window)
+    mask.masked_fill_(allowed, 0.0)
+    return mask
+
+
 class CausalSelfAttention(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
@@ -90,7 +103,19 @@ class CausalSelfAttention(nn.Module):
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
         q, k = norm(q), norm(k)
 
-        y = fa3.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+        if USE_FA3:
+            y = fa3.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+        else:
+            if self.n_kv_head != self.n_head:
+                repeats = self.n_head // self.n_kv_head
+                k = k.repeat_interleave(repeats, dim=2)
+                v = v.repeat_interleave(repeats, dim=2)
+            q = q.transpose(1, 2)
+            k = k.transpose(1, 2)
+            v = v.transpose(1, 2)
+            mask = sdpa_window_mask(T, window_size, q.device)
+            y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, is_causal=mask is None)
+            y = y.transpose(1, 2)
         y = y.contiguous().view(B, T, -1)
         y = self.c_proj(y)
         return y

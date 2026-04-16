@@ -473,7 +473,7 @@ WARMDOWN_RATIO = 0.5    # fraction of time budget for LR warmdown
 FINAL_LR_FRAC = 0.0     # final LR as fraction of initial
 
 # Model size
-DEPTH = 6               # smaller baseline for a 32GB GPU
+DEPTH = 8               # restore capacity now that the memory-safe batch regime works
 DEVICE_BATCH_SIZE = 16  # logits tensor dominates memory; keep this conservative
 
 # ---------------------------------------------------------------------------
